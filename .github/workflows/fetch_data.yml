@@ -1,0 +1,41 @@
+name: Fetch Market Data
+
+# 9:30pm UTC Mon–Fri = 5:30am SGT Tue–Sat
+# ≈90 min after US market close (4pm ET EDT) — data fully settled by then.
+# Adjust to 22:30 UTC in winter if yfinance lags on EST close.
+on:
+  schedule:
+    - cron: '30 21 * * 1-5'
+  workflow_dispatch:          # manual trigger for testing / backfills
+
+jobs:
+  fetch:
+    name: Fetch OHLCV + fundamentals
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run data fetcher
+        run: python scripts/fetch_data.py
+
+      # Stores the DB as a downloadable artifact (30-day retention).
+      # Phase 4: replace this step with a Supabase upload using SUPABASE_SERVICE_ROLE_KEY.
+      - name: Upload database artifact
+        if: always()          # upload even if some tickers failed so partial data is preserved
+        uses: actions/upload-artifact@v4
+        with:
+          name: medallion-db-${{ github.run_number }}
+          path: data/medallion.db
+          retention-days: 30

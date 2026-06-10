@@ -1,12 +1,16 @@
 import type { NextConfig } from 'next'
 
+const ibkrGatewayUrl = process.env.IBKR_GATEWAY_URL
+
 const nextConfig: NextConfig = {
   // Allow IBKR Client Portal API (self-signed cert in local dev)
   async rewrites() {
+    if (!ibkrGatewayUrl) return []
+
     return [
       {
         source: '/api/ibkr/:path*',
-        destination: `${process.env.IBKR_GATEWAY_URL}/:path*`,
+        destination: `${ibkrGatewayUrl}/:path*`,
       },
     ]
   },

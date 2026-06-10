@@ -19,6 +19,35 @@ Built for a total-return mandate targeting >10% annualised vs VOO/SPY.
 
 ---
 
+## Local Setup
+
+### Python (data layer + backtest scripts)
+
+Use Python 3.12 to match CI. Create and activate a virtual environment, then install dependencies:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+Fetch market data into the local SQLite database:
+
+```bash
+python scripts/fetch_data.py
+```
+
+### Node.js (terminal UI)
+
+```bash
+npm install
+npm run dev
+```
+
+Copy `.env.example` to `.env.local` and fill in values before connecting external services.
+
+---
+
 ## Architecture
 
 ```
@@ -82,8 +111,8 @@ Notion workspace: [Master Hub](https://app.notion.com/p/37ae57d4d5da812c9cddf932
 ## Build Roadmap
 
 - [x] Phase 0 — Foundation (repo, CLAUDE.md, env setup)
-- [ ] Phase 1 — Data layer
-- [ ] Phase 2 — Signal engine + backtest
+- [x] Phase 1 — Data layer
+- [ ] Phase 2 — Signal engine + backtest (skeletons in place)
 - [ ] Phase 3 — Terminal UI
 - [ ] Phase 4 — Claude integration + IBKR routing
 - [ ] Phase 5 — Hardening + CV polish

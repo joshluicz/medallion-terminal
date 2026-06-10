@@ -1,0 +1,6 @@
+yfinance>=0.2.50
+pandas>=2.0.0
+openbb>=4.3.0
+python-dotenv>=1.0.0
+vectorbt>=0.26.0
+quantstats>=0.0.62
