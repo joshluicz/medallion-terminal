@@ -1,249 +1,275 @@
 #!/usr/bin/env python3
 """
-Medallion Terminal -- Phase 2 skeleton: signal engine backtest harness.
+Medallion Terminal — TGVM v2 backtest.
 
-Sanity check: 12-1 month momentum on VOO vs buy-and-hold.
-Expand in Phase 2 to cover the full Signal Library v1:
-  - RSI(14)            weight 15%
-  - MACD crossover     weight 15%
-  - 50/200 MA cross    weight 10%
-  - 12-1m momentum     weight 25%  <-- implemented here
-  - Forward P/E rank   weight 20%
-  - EPS revision dir   weight 15%
+Fundamental vetoes require point-in-time data. Applying a current snapshot
+to historical dates introduces unknown bias. Vetoes are live-only controls.
+Backtest measures pure VAM + regime performance.
+
+Weekly rebalance: top 4 qualified stocks, equal weight (25% each slot).
+Regime gate (RISK_ON only), -25% hard stop per position. No fundamental vetoes.
+Benchmark: VOO buy-and-hold.
 
 Usage:
     python scripts/backtest.py
-    python scripts/backtest.py --ticker QQQ --cash 50000
+    python scripts/backtest.py --cash 100000
+    python scripts/backtest.py --skip-extend   # skip 5y SP100 re-fetch
 """
 
 from __future__ import annotations
 
 import argparse
 import sqlite3
+import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-DB_PATH = Path(__file__).resolve().parent.parent / "data" / "medallion.db"
+_SCRIPTS = Path(__file__).resolve().parent
+_REPO = _SCRIPTS.parent
+sys.path.insert(0, str(_SCRIPTS))
 
-TRADING_DAYS_1M = 21
-TRADING_DAYS_12M = 252
+from tgvm_core import (  # noqa: E402
+    DB_PATH,
+    REGIME_MA,
+    RISK_FREE_RATE,
+    STOP_LOSS,
+    TOP_N_HOLDINGS,
+    compute_regime_series,
+    compute_signals_for_date,
+    load_all_closes,
+    load_stock_tickers,
+)
+from universe import REGIME_TICKER  # noqa: E402
+
+BENCHMARK = "VOO"
+REPORTS_DIR = _REPO / "reports"
+TEARSHEET_PATH = REPORTS_DIR / "tgvm_tearsheet.html"
 
 
-# ---- Data -------------------------------------------------------------------
+def weekly_rebalance_dates(calendar: pd.DatetimeIndex) -> pd.DatetimeIndex:
+    """Last trading day of each week (Friday-aligned)."""
+    s = pd.Series(calendar, index=calendar)
+    fridays = s.groupby(pd.Grouper(freq="W-FRI")).last().dropna()
+    return pd.DatetimeIndex(fridays.values).sort_values()
 
-def load_prices(ticker: str) -> pd.Series:
+
+def run_backtest(init_cash: float = 100_000.0) -> dict:
     if not DB_PATH.exists():
-        raise FileNotFoundError(
-            f"DB not found at {DB_PATH}. Run scripts/fetch_data.py first."
-        )
+        raise FileNotFoundError(f"DB not found at {DB_PATH}. Run scripts/fetch_data.py first.")
 
     conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql(
-        "SELECT date, close FROM prices WHERE ticker = ? ORDER BY date",
-        conn,
-        params=(ticker,),
-        parse_dates=["date"],
-        index_col="date",
-    )
+    spy = load_all_closes(conn, [REGIME_TICKER])
+    voo = load_all_closes(conn, [BENCHMARK])
+    stocks = load_stock_tickers(conn)
+    stock_closes = load_all_closes(conn, stocks)
     conn.close()
 
-    if df.empty:
-        raise ValueError(f"No price data for {ticker} in local DB.")
+    if spy.empty or voo.empty or stock_closes.empty:
+        raise ValueError("Insufficient price data for backtest.")
 
-    return df["close"].rename(ticker)
+    spy_s = spy[REGIME_TICKER].dropna()
+    voo_s = voo[BENCHMARK].dropna()
+    regime_df = compute_regime_series(spy_s)
 
+    calendar = stock_closes.index.intersection(voo_s.index).intersection(spy_s.index).sort_values()
+    stock_closes = stock_closes.reindex(calendar).ffill()
+    voo_s = voo_s.reindex(calendar).ffill()
+    full_closes = stock_closes.copy()
 
-# ---- Signal: 12-1 month momentum --------------------------------------------
+    warmup = max(REGIME_MA, 252)
+    if len(calendar) <= warmup:
+        raise ValueError(f"Not enough history ({len(calendar)} days); need >{warmup}.")
+    bt_calendar = calendar[warmup:]
+    bt_closes = stock_closes.loc[bt_calendar]
+    voo_s = voo_s.loc[bt_calendar]
+    calendar = bt_calendar
 
-def momentum_signal(price: pd.Series) -> pd.Series:
-    """
-    12-1 month momentum: 12-month return minus 1-month return.
-    Positive -> bullish; negative -> bearish.
-    """
-    ret_12m = price.pct_change(TRADING_DAYS_12M)
-    ret_1m = price.pct_change(TRADING_DAYS_1M)
-    return (ret_12m - ret_1m).rename("momentum")
+    rebal_dates = weekly_rebalance_dates(calendar)
+    rebal_set = set(rebal_dates)
 
+    daily_rets = bt_closes.pct_change()
+    voo_rets = voo_s.pct_change().fillna(0)
 
-def momentum_regime(mom: pd.Series) -> pd.Series:
-    """True when the momentum signal is bullish (above zero)."""
-    return (mom > 0).rename("in_market")
+    holdings: dict[str, float] = {}
+    entry_prices: dict[str, float] = {}
+    trades = 0
+    in_market_days = 0
 
+    port_rets = pd.Series(0.0, index=calendar, name="TGVM")
+    empty_fundamentals = pd.DataFrame()
 
-def regime_changes(regime: pd.Series) -> tuple[pd.Series, pd.Series]:
-    """Entry/exit booleans on regime flips (no look-ahead)."""
-    prev = regime.shift(1)
-    prev = prev.where(prev.notna(), False).astype(bool)
-    entries = regime & ~prev
-    exits = ~regime & prev
-    return entries, exits
+    for i, dt in enumerate(calendar):
+        if holdings:
+            to_exit = []
+            for t in list(holdings.keys()):
+                if t not in bt_closes.columns:
+                    continue
+                px = bt_closes.at[dt, t]
+                if pd.isna(px):
+                    continue
+                entry = entry_prices.get(t, px)
+                if px <= entry * (1 - STOP_LOSS):
+                    to_exit.append(t)
+            for t in to_exit:
+                holdings.pop(t)
+                entry_prices.pop(t, None)
+                trades += 1
 
+        if dt in rebal_set:
+            regime_status = regime_df.loc[dt, "status"] if dt in regime_df.index else "RISK_OFF"
+            signals = compute_signals_for_date(
+                dt,
+                full_closes,
+                regime_status,
+                empty_fundamentals,
+                full_closes.index,
+                disable_fundamental_veto=True,
+            )
+            qualified = [s for s in signals if s.qualified]
+            qualified.sort(key=lambda s: s.vam_score or 0, reverse=True)
+            picks = [s.ticker for s in qualified[:TOP_N_HOLDINGS]]
 
-# ---- Backtest ---------------------------------------------------------------
+            if regime_status != "RISK_ON" or len(picks) < 1:
+                if holdings:
+                    trades += len(holdings)
+                holdings = {}
+                entry_prices = {}
+            else:
+                slot_w = 1.0 / TOP_N_HOLDINGS
+                new_holdings: dict[str, float] = {}
+                new_entries: dict[str, float] = {}
+                for t in picks[:TOP_N_HOLDINGS]:
+                    px = bt_closes.at[dt, t]
+                    if pd.isna(px):
+                        continue
+                    new_holdings[t] = slot_w
+                    new_entries[t] = float(px)
+                if set(new_holdings.keys()) != set(holdings.keys()):
+                    trades += 1
+                holdings = new_holdings
+                entry_prices = new_entries
 
-def run(ticker: str, init_cash: float) -> None:
-    try:
-        import vectorbt as vbt
-    except ImportError:
-        print("[!!] vectorbt not installed. Run: pip install -r requirements.txt")
-        print("     Falling back to pandas-only stats.\n")
-        _run_pandas_fallback(ticker, init_cash)
-        return
+        day_ret = 0.0
+        invested = 0.0
+        for t, w in holdings.items():
+            r = daily_rets.at[dt, t] if t in daily_rets.columns else 0.0
+            if pd.isna(r):
+                r = 0.0
+            day_ret += w * r
+            invested += w
+        port_rets.iloc[i] = day_ret
+        if invested > 0.01:
+            in_market_days += 1
 
-    price = load_prices(ticker)
-    mom = momentum_signal(price).dropna()
-    price = price.loc[mom.index]
+    years = len(calendar) / 252
+    total_ret = (1 + port_rets).prod() - 1
+    voo_total = (1 + voo_rets).prod() - 1
+    ann_ret = (1 + total_ret) ** (1 / years) - 1 if years > 0 else 0
+    voo_ann = (1 + voo_total) ** (1 / years) - 1 if years > 0 else 0
 
-    regime = momentum_regime(mom)
-    entries, exits = regime_changes(regime)
-
-    pf = vbt.Portfolio.from_signals(
-        price,
-        entries,
-        exits,
-        init_cash=init_cash,
-        freq="D",
-        fees=0.0,       # zero-commission IBKR US ETFs
-        slippage=0.001, # 0.1% slippage estimate
-    )
-    bh = vbt.Portfolio.from_holding(price, init_cash=init_cash, freq="D")
-
-    _print_results(ticker, price, pf, bh, regime)
-
-
-def _stat(stats: pd.Series, key: str, default=0):
-    val = stats.get(key, default)
-    if pd.isna(val):
-        return default
-    return val
-
-
-def _print_results(ticker, price, pf, bh, regime) -> None:
-    strat_stats = pf.stats()
-    bh_stats = bh.stats()
-
-    print(f"\n{'=' * 60}")
-    print(f"  Medallion Terminal -- Backtest: {ticker}")
-    print(f"  Signal  : 12-1 month momentum (long when > 0, else cash)")
-    print(f"  Period  : {price.index[0].date()} -> {price.index[-1].date()}")
-    print(f"  Days    : {len(price)}")
-    print(f"  In mkt  : {regime.mean() * 100:.1f}% of days")
-    print(f"{'=' * 60}")
-
-    def _pct(val):
-        try:
-            return f"{float(val):.2f}%"
-        except (TypeError, ValueError):
-            return str(val)
-
-    def _f2(val):
-        try:
-            return f"{float(val):.4f}"
-        except (TypeError, ValueError):
-            return str(val)
-
-    rows = [
-        (
-            "Total Return",
-            _pct(_stat(strat_stats, "Total Return [%]")),
-            _pct(_stat(bh_stats, "Total Return [%]")),
-        ),
-        (
-            "Annualised Ret",
-            _pct(_stat(strat_stats, "Annualized Return [%]")),
-            _pct(_stat(bh_stats, "Annualized Return [%]")),
-        ),
-        (
-            "Sharpe Ratio",
-            _f2(_stat(strat_stats, "Sharpe Ratio")),
-            _f2(_stat(bh_stats, "Sharpe Ratio")),
-        ),
-        (
-            "Max Drawdown",
-            _pct(_stat(strat_stats, "Max Drawdown [%]")),
-            _pct(_stat(bh_stats, "Max Drawdown [%]")),
-        ),
-        (
-            "Win Rate",
-            _pct(_stat(strat_stats, "Win Rate [%]")),
-            "N/A",
-        ),
-        (
-            "# Trades",
-            str(int(_stat(strat_stats, "Total Trades", 0))),
-            "1",
-        ),
-    ]
-
-    print(f"  {'Metric':<20}  {'Strategy':>12}  {'Buy & Hold':>12}")
-    print(f"  {'-' * 20}  {'-' * 12}  {'-' * 12}")
-    for label, strat_val, bh_val in rows:
-        print(f"  {label:<20}  {strat_val:>12}  {bh_val:>12}")
-
-    print(f"\n  Benchmark hurdle : 3.55% (MYR FD rate)")
-    print(f"  Target           : >10% annualised vs VOO")
-    print(f"{'=' * 60}\n")
-
-
-def _run_pandas_fallback(ticker: str, init_cash: float) -> None:
-    """Minimal stats without vectorbt, so the skeleton runs in all envs."""
-    price = load_prices(ticker)
-    mom = momentum_signal(price).dropna()
-    price = price.loc[mom.index]
-    regime = momentum_regime(mom)
-
-    daily_ret = price.pct_change().fillna(0)
-    strat_ret = daily_ret * regime.shift(1).fillna(0)
-
-    total_days = len(price)
-    years = total_days / 252
-    total_return = (1 + strat_ret).prod() - 1
-    bh_return = price.iloc[-1] / price.iloc[0] - 1
-    ann_return = (1 + total_return) ** (1 / years) - 1
-    ann_bh_return = (1 + bh_return) ** (1 / years) - 1
+    excess = port_rets - RISK_FREE_RATE / 252
     sharpe = (
-        (strat_ret.mean() / strat_ret.std()) * np.sqrt(252)
-        if strat_ret.std()
+        (excess.mean() / excess.std()) * np.sqrt(252)
+        if excess.std() and excess.std() > 0
         else float("nan")
     )
-    drawdown = (price / price.cummax() - 1).min()
+    voo_excess = voo_rets - RISK_FREE_RATE / 252
+    voo_sharpe = (voo_excess.mean() / voo_excess.std()) * np.sqrt(252) if voo_excess.std() else float("nan")
 
-    print(f"\n{'=' * 60}")
-    print(f"  Medallion Terminal -- Backtest: {ticker} (pandas fallback)")
-    print(f"  Signal  : 12-1 month momentum")
-    print(f"  Period  : {price.index[0].date()} -> {price.index[-1].date()}")
-    print(f"  In mkt  : {regime.mean() * 100:.1f}% of days")
-    print(f"{'=' * 60}")
-    print(f"  {'Metric':<20}  {'Strategy':>12}  {'Buy & Hold':>12}")
-    print(f"  {'-' * 20}  {'-' * 12}  {'-' * 12}")
-    print(f"  {'Total Return':<20}  {total_return * 100:>11.2f}%  {bh_return * 100:>11.2f}%")
-    print(f"  {'Annualised Ret':<20}  {ann_return * 100:>11.2f}%  {ann_bh_return * 100:>11.2f}%")
-    print(f"  {'Sharpe Ratio':<20}  {sharpe:>12.4f}  {'N/A':>12}")
-    print(f"  {'Max Drawdown':<20}  {drawdown * 100:>11.2f}%  {'':>12}")
-    print(f"\n  Benchmark hurdle : 3.55% (MYR FD rate)")
-    print(f"  Target           : >10% annualised vs VOO")
-    print(f"{'=' * 60}\n")
+    cum = (1 + port_rets).cumprod()
+    max_dd = (cum / cum.cummax() - 1).min()
+    voo_cum = (1 + voo_rets).cumprod()
+    voo_max_dd = (voo_cum / voo_cum.cummax() - 1).min()
+
+    win_rate = (port_rets > 0).mean()
+
+    return {
+        "calendar": calendar,
+        "port_rets": port_rets,
+        "voo_rets": voo_rets,
+        "total_ret": total_ret,
+        "voo_total": voo_total,
+        "ann_ret": ann_ret,
+        "voo_ann": voo_ann,
+        "sharpe": sharpe,
+        "voo_sharpe": voo_sharpe,
+        "max_dd": max_dd,
+        "voo_max_dd": voo_max_dd,
+        "win_rate": win_rate,
+        "trades": trades,
+        "time_in_market_pct": in_market_days / len(calendar) * 100,
+        "years": years,
+        "trading_days": len(calendar),
+    }
 
 
-# ---- Entry ------------------------------------------------------------------
+def save_tearsheet(port_rets: pd.Series, voo_rets: pd.Series) -> Path | None:
+    import quantstats as qs
+
+    if port_rets.std() == 0 or port_rets.abs().sum() == 0:
+        print("  [skip] QuantStats tearsheet — strategy had zero variance (no trades).")
+        return None
+
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    qs.reports.html(
+        port_rets,
+        benchmark=voo_rets,
+        output=str(TEARSHEET_PATH),
+        title="Medallion Terminal — TGVM v2 Backtest",
+        download_filename=TEARSHEET_PATH.name,
+    )
+    return TEARSHEET_PATH
+
+
+def print_results(m: dict) -> None:
+    cal = m["calendar"]
+    print(f"\n{'=' * 72}")
+    print("  Medallion Terminal — TGVM v2 Backtest (clean: VAM + regime only)")
+    print(f"  Backtest window: {cal[0].date()} to {cal[-1].date()}, {m['trading_days']} trading days")
+    print(f"  Benchmark    : {BENCHMARK} buy-and-hold")
+    print(f"  Risk-free    : {RISK_FREE_RATE * 100:.2f}% (MYR FD hurdle)")
+    print(f"  Positions    : top {TOP_N_HOLDINGS} @ {100 / TOP_N_HOLDINGS:.0f}% each")
+    print(f"{'=' * 72}")
+    print(f"  {'Metric':<22}  {'TGVM':>12}  {BENCHMARK:>12}")
+    print(f"  {'-' * 22}  {'-' * 12}  {'-' * 12}")
+    print(f"  {'Annualised Return':<22}  {m['ann_ret'] * 100:>11.2f}%  {m['voo_ann'] * 100:>11.2f}%")
+    print(f"  {'Total Return':<22}  {m['total_ret'] * 100:>11.2f}%  {m['voo_total'] * 100:>11.2f}%")
+    print(f"  {'Sharpe Ratio':<22}  {m['sharpe']:>12.4f}  {m['voo_sharpe']:>12.4f}")
+    print(f"  {'Max Drawdown':<22}  {m['max_dd'] * 100:>11.2f}%  {m['voo_max_dd'] * 100:>11.2f}%")
+    print(f"  {'Win Rate (daily)':<22}  {m['win_rate'] * 100:>11.2f}%  {'N/A':>12}")
+    print(f"  {'# Rebalance events':<22}  {m['trades']:>12}  {'1':>12}")
+    print(f"  {'Time in market':<22}  {m['time_in_market_pct']:>11.1f}%  {'100.0':>11}%")
+    print(f"\n  *** CAVEAT: ~{m['years']:.1f}-year sample is a PLUMBING CHECK only.")
+    print("  Not statistically valid. Do not infer alpha from this.")
+    print(f"{'=' * 72}\n")
+
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Medallion Terminal backtest runner")
+    parser = argparse.ArgumentParser(description="TGVM v2 backtest")
+    parser.add_argument("--cash", type=float, default=100_000, help="Starting cash (display only)")
     parser.add_argument(
-        "--ticker",
-        default="VOO",
-        help="Ticker to backtest (must be in local DB)",
-    )
-    parser.add_argument(
-        "--cash",
-        default=10_000,
-        type=float,
-        help="Starting portfolio cash",
+        "--skip-extend",
+        action="store_true",
+        help="Skip 5y SP100/SPY/VOO history extension",
     )
     args = parser.parse_args()
-    run(args.ticker.upper(), args.cash)
+
+    try:
+        if not args.skip_extend:
+            from extend_sp100_history import extend_sp100_history
+
+            extend_sp100_history()
+
+        m = run_backtest(args.cash)
+        print_results(m)
+        path = save_tearsheet(m["port_rets"], m["voo_rets"])
+        if path:
+            print(f"  QuantStats tearsheet: {path}\n")
+    except Exception as exc:
+        print(f"[!!] {exc}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

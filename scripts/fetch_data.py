@@ -19,6 +19,10 @@ import pandas as pd
 import yfinance as yf
 from dotenv import load_dotenv
 
+_SCRIPTS = Path(__file__).resolve().parent
+sys.path.insert(0, str(_SCRIPTS))
+from universe import get_all_tickers, is_etf  # noqa: E402
+
 # Load .env.local (Next.js convention) then fall back to .env
 _repo_root = Path(__file__).resolve().parent.parent
 load_dotenv(_repo_root / ".env.local")
@@ -33,10 +37,7 @@ try:
 except ImportError:
     _OPENBB_AVAILABLE = False
 
-DEFAULT_TICKERS = [
-    "VOO", "QQQ", "MU", "NVDA", "NOW", "META",
-    "GOOG", "MSFT", "GLD", "CRWV", "NBIS", "VXUS", "QQQM",
-]
+DEFAULT_TICKERS = get_all_tickers()
 
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "medallion.db"
 
@@ -74,6 +75,11 @@ def init_db(conn: sqlite3.Connection) -> None:
             next_earnings_date      TEXT,   -- ISO-8601 YYYY-MM-DD, null for ETFs
             updated_at              TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS securities (
+            ticker   TEXT PRIMARY KEY,
+            is_etf   INTEGER NOT NULL DEFAULT 0   -- 1 = ETF, excluded from momentum ranking
+        );
     """)
     # Migrate existing DB: add eps_revision_direction if the column is absent
     existing = {row[1] for row in conn.execute("PRAGMA table_info(fundamentals)")}
@@ -85,6 +91,14 @@ def init_db(conn: sqlite3.Connection) -> None:
     for col, definition in [("eps_revision_direction", "TEXT")]:
         if col not in existing:
             conn.execute(f"ALTER TABLE fundamentals ADD COLUMN {col} {definition}")
+    conn.commit()
+
+
+def upsert_security(ticker: str, conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO securities (ticker, is_etf) VALUES (?, ?)",
+        (ticker, 1 if is_etf(ticker) else 0),
+    )
     conn.commit()
 
 
@@ -252,17 +266,21 @@ def main() -> None:
     fail: list[tuple[str, str]]           = []
 
     provider_tag = "openbb+yfinance" if _OPENBB_AVAILABLE else "yfinance"
-    print(f"Medallion Terminal -- fetching {len(tickers)} tickers  [{provider_tag}]\n")
+    etf_n = sum(1 for t in tickers if is_etf(t))
+    print(f"Medallion Terminal -- fetching {len(tickers)} tickers  [{provider_tag}]")
+    print(f"  Universe: S&P 100 + holdings + SPY  |  ETFs (no rank): {etf_n}\n")
 
-    for ticker in tickers:
+    for i, ticker in enumerate(tickers, 1):
         try:
+            upsert_security(ticker, conn)
             n, d_min, d_max = upsert_prices(ticker, conn)
             src = upsert_fundamentals(ticker, conn)
             ok.append((ticker, n, d_min, d_max))
-            print(f"  [OK]  {ticker:<6}  {n:>4} rows  {d_min} -> {d_max}  [{src}]")
+            tag = "ETF" if is_etf(ticker) else "STK"
+            print(f"  [{i:>3}/{len(tickers)}] [OK]  {ticker:<6} {tag}  {n:>4} rows  {d_min} -> {d_max}  [{src}]")
         except Exception as exc:
             fail.append((ticker, str(exc)))
-            print(f"  [!!]  {ticker:<6}  FAILED: {exc}", file=sys.stderr)
+            print(f"  [{i:>3}/{len(tickers)}] [!!]  {ticker:<6}  FAILED: {exc}", file=sys.stderr)
 
     conn.close()
 

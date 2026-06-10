@@ -60,18 +60,46 @@ Frameworks: Warren Buffett fundamentals × quant signal logic (Jane Street / Cit
 
 ---
 
-## Signal Library v1
+## Signal Library v2 — TGVM
 
-| Signal | Type | Weight |
-|---|---|---|
-| RSI(14) | Technical | 15% |
-| MACD crossover | Technical | 15% |
-| 50/200 MA golden/death cross | Technical | 10% |
-| 12-1 month momentum vs SPY | Quantitative | 25% |
-| Forward P/E vs sector median | Fundamental | 20% |
-| EPS revision direction | Fundamental | 15% |
+**TGVM: Trend-Gated, Vol-adjusted Momentum with Fundamental Veto**
 
-Composite score 0–100. Threshold for booster entry: >65. Exit signal: <40 or hard stop hit.
+Replaces Signal Library v1 (composite weighted score). Cross-sectional ranking across S&P 100 + holdings (~100 stocks). ETFs excluded from ranking.
+
+### Layer 0 — Regime Gate
+- SPY close vs 200-day SMA
+- `RISK_ON` if SPY > 200d SMA, else `RISK_OFF`
+- Stored in `regime` table; no new longs when `RISK_OFF`
+
+### Layer 1 — Vol-Adjusted Momentum (stocks only)
+- `raw_mom = price(t−21d) / price(t−252d) − 1` (12−1 month momentum)
+- `vol_90d = stdev(daily returns, 90d) × √252`
+- `vam_score = raw_mom / vol_90d`
+- Cross-sectional percentile rank 0–100 across qualifying stocks
+- Requires ≥252 trading days of history
+
+### Layer 2 — Fundamental Veto (binary, stocks only, live only)
+- Veto if: trailing EPS < 0, OR forward P/E > 3× cross-sectional median, OR earnings within 2 trading days (day-of + day-before)
+- NULL/missing data does **not** veto (innocent until proven guilty)
+- **Backtest disables all fundamental vetoes** (no point-in-time data)
+
+### Layer 3 — Entry Timing
+- RSI(14): `FULL` entry if RSI < 50, else `STAGED`
+
+### Qualification
+`qualified = 1` only when: regime `RISK_ON` AND percentile rank ≥ 75 AND not vetoed (live).
+
+### Booster Sleeve Rules (unchanged)
+- Top 4 qualified stocks, equal weight (25% each slot; cash if slot empty)
+- Hard stop: −25% from entry per position
+- Hard stop (booster mandate): −30% from entry on speculative names
+- Weekly rebalance; benchmark VOO/SPY total return
+- Risk-free hurdle: 3.55% MYR FD rate
+
+### Scripts
+- `scripts/universe.py` — S&P 100 + holdings (quarterly manual refresh)
+- `scripts/signal_engine.py` — daily TGVM snapshot → `signals_v2` table
+- `scripts/backtest.py` — weekly TGVM backtest + QuantStats tearsheet
 
 ---
 
@@ -112,15 +140,15 @@ Composite score 0–100. Threshold for booster entry: >65. Exit signal: <40 or h
 | FD deployment split B1/B2/B3 | Pending clarification session (before 12 Sep 2026) |
 | Data provider (free vs Polygon.io) | Decide at Phase 1 start |
 | IBKR connection: TWS vs Client Portal API | Client Portal recommended (no local install needed) |
-| Booster v1 pick post-FD | Pending signal engine build |
+| Booster v1 pick post-FD | TGVM v2 engine built; awaiting FD deployment |
 
 ---
 
 ## Build Phases
 
-- **Phase 0** — Foundation (repo, CLAUDE.md, env setup) ← YOU ARE HERE
+- **Phase 0** — Foundation (repo, CLAUDE.md, env setup)
 - **Phase 1** — Data layer (fetcher, DB, scheduler)
-- **Phase 2** — Signal engine (technicals, momentum, fundamentals, backtest)
+- **Phase 2** — Signal engine (TGVM v2, backtest) ← IN PROGRESS
 - **Phase 3** — Terminal UI (Next.js, Bloomberg dark theme, all panels)
 - **Phase 4** — Claude integration (API, trade staging, IBKR routing)
 - **Phase 5** — Hardening + CV polish (Sharpe tracker, PDF export, demo video)
